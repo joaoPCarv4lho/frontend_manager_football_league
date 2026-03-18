@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Gestão da Liga de Futebol</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>⚽ Gestão da Liga de Futebol</h1>
+      <p>Controle financeiro, membros, partidas e scouts em um só lugar.</p>
+    </header>
+
+    <main>
+      <section id="onboarding" class="card"></section>
+
+      <section class="grid two-cols">
+        <article class="card">
+          <h2>Financeiro (Mês Atual)</h2>
+          <form id="current-month-form" class="form-grid"></form>
+          <div id="current-month-summary" class="summary"></div>
+        </article>
+
+        <article class="card">
+          <h2>Membros</h2>
+          <form id="member-form" class="form-grid compact">
+            <label>
+              Nome
+              <input id="member-name" required />
+            </label>
+            <label>
+              Posição
+              <select id="member-position">
+                <option value="Ataque">Ataque</option>
+                <option value="Meio">Meio</option>
+                <option value="Zagueiro">Zagueiro</option>
+                <option value="Goleiro">Goleiro</option>
+              </select>
+            </label>
+            <label>
+              Gols
+              <input id="member-goals" type="number" min="0" value="0" />
+            </label>
+            <label>
+              Assistências
+              <input id="member-assists" type="number" min="0" value="0" />
+            </label>
+            <label class="checkbox">
+              <input id="member-paid" type="checkbox" />
+              Pagou mensalidade neste mês
+            </label>
+            <button type="submit">Salvar membro</button>
+          </form>
+          <div class="table-wrap">
+            <table id="members-table">
+              <thead>
+                <tr>
+                  <th>Nome</th>
+                  <th>Posição</th>
+                  <th>Gols</th>
+                  <th>Assist.</th>
+                  <th>Pago</th>
+                  <th>Ações</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section class="card">
+        <h2>Partidas</h2>
+        <form id="match-form" class="form-grid"></form>
+        <h3>Jogadores da partida (camisa editável por jogo)</h3>
+        <div id="match-players" class="players-grid"></div>
+        <button id="save-match" class="primary">Salvar partida</button>
+
+        <div class="table-wrap">
+          <table id="matches-table">
+            <thead>
+              <tr>
+                <th>Data</th>
+                <th>Placar</th>
+                <th>Jogadores registrados</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="grid two-cols">
+        <article class="card">
+          <h2>Relatório Financeiro</h2>
+          <div id="finance-report"></div>
+        </article>
+        <article class="card">
+          <h2>Relatório de Scouts e Premiações</h2>
+          <div id="scout-report"></div>
+        </article>
+      </section>
+    </main>
+
+    <template id="finance-fields-template">
+      <label>
+        Mensalidade total recebida
+        <input type="number" min="0" step="0.01" data-field="mensalidade" required />
+      </label>
+      <label>
+        Valor recebido para o almoço
+        <input type="number" min="0" step="0.01" data-field="almocoRecebido" required />
+      </label>
+      <label>
+        Despesa do almoço
+        <input type="number" min="0" step="0.01" data-field="almocoDespesa" required />
+      </label>
+      <label>
+        Quantidade de convidados
+        <input type="number" min="0" step="1" data-field="convidadosQtd" required />
+      </label>
+      <label>
+        Valor por convidado
+        <input type="number" min="0" step="0.01" data-field="convidadosValor" required />
+      </label>
+      <label>
+        Receita convidados (calculada)
+        <input type="number" min="0" step="0.01" data-field="convidadosReceita" readonly />
+      </label>
+      <label>
+        Quadra
+        <input type="number" min="0" step="0.01" data-field="quadra" required />
+      </label>
+      <label>
+        Custos diversos
+        <input type="number" min="0" step="0.01" data-field="custosDiversos" required />
+      </label>
+    </template>
+
+    <script src="app.js"></script>
+  </body>
+</html>
