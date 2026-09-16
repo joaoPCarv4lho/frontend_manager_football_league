@@ -1,344 +1,806 @@
-const KEY = "league-manager-v1";
+/* ============================================================
+   Gestão da Liga de Futebol — app mobile-first (vanilla JS)
+   Modelo v2: scouts derivados das partidas, mensalidade fixa
+   por jogador, pagamento por mês, sorteio de times gravado.
+   ============================================================ */
+
+const KEY = "league-manager-v2";
+
 const now = new Date();
 const currentMonthIndex = now.getMonth();
 const currentYear = now.getFullYear();
 const monthNames = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho","Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"];
 
-const initialState = {
+const FINANCE_FIELDS = ["almocoRecebido", "almocoDespesa", "convidadosQtd", "convidadosValor", "quadra", "custosDiversos"];
+
+const defaultState = () => ({
+  version: 2,
   setupDone: false,
+  settings: { monthlyFee: 0 },
   previousYearBalance: 0,
-  finance: {},
-  members: [],
-  matches: []
-};
+  finance: {},   // key "AAAA-MM" -> { almocoRecebido, almocoDespesa, convidadosQtd, convidadosValor, quadra, custosDiversos, mensalidadeManual|null }
+  payments: {},  // key "AAAA-MM" -> { memberId: true }
+  members: [],   // { id, name, position, shirt }
+  matches: []    // { id, date, teamAName, teamBName, scoreA, scoreB, players:[{memberId, team, shirt, goals, assists}] }
+});
 
-const state = JSON.parse(localStorage.getItem(KEY) || "null") || structuredClone(initialState);
+let state = loadState();
 
-const fmt = (v) => Number(v || 0).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
-const monthKey = (year, monthIdx) => `${year}-${String(monthIdx + 1).padStart(2, "0")}`;
-const parseN = (v) => Number.parseFloat(v || 0) || 0;
-
+/* ---------------- Helpers ---------------- */
+function loadState() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(KEY) || "null");
+    if (raw && raw.version === 2) return Object.assign(defaultState(), raw);
+  } catch (_) {}
+  return defaultState();
+}
 function saveState() {
-  localStorage.setItem(KEY, JSON.stringify(state));
+  try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (_) {}
+}
+const fmt = (v) => Number(v || 0).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+const parseN = (v) => Number.parseFloat(v) || 0;
+const monthKey = (year, monthIdx) => `${year}-${String(monthIdx + 1).padStart(2, "0")}`;
+const uid = () => (crypto.randomUUID ? crypto.randomUUID() : "id" + Date.now() + Math.random().toString(16).slice(2));
+const el = (id) => document.getElementById(id);
+const initials = (name) => name.trim().split(/\s+/).slice(0, 2).map((w) => w[0]).join("").toUpperCase();
+const memberById = (id) => state.members.find((m) => m.id === id);
+
+function toast(msg) {
+  const t = el("toast");
+  t.textContent = msg;
+  t.classList.remove("hidden");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => t.classList.add("hidden"), 2200);
 }
 
-function computeMonthTotals(m) {
+/* ---------------- Cálculos derivados ---------------- */
+// Scouts vêm SÓ das partidas.
+function scoutsOf(memberId) {
+  let goals = 0, assists = 0, games = 0, wins = 0, losses = 0, draws = 0;
+  state.matches.forEach((match) => {
+    const p = match.players.find((x) => x.memberId === memberId);
+    if (!p) return;
+    games++;
+    goals += parseN(p.goals);
+    assists += parseN(p.assists);
+    if (p.team === "A" || p.team === "B") {
+      const a = parseN(match.scoreA), b = parseN(match.scoreB);
+      const won = (p.team === "A" && a > b) || (p.team === "B" && b > a);
+      const lost = (p.team === "A" && a < b) || (p.team === "B" && b < a);
+      if (won) wins++; else if (lost) losses++; else draws++;
+    }
+  });
+  return { goals, assists, games, wins, losses, draws, total: goals + assists };
+}
+
+function paidCount(key) {
+  const p = state.payments[key] || {};
+  return state.members.reduce((n, m) => n + (p[m.id] ? 1 : 0), 0);
+}
+
+// Mensalidade do mês: manual (meses passados do setup) ou automática (pagantes × valor).
+function getMensalidade(key) {
+  const f = state.finance[key];
+  if (f && f.mensalidadeManual != null) return parseN(f.mensalidadeManual);
+  return paidCount(key) * parseN(state.settings.monthlyFee);
+}
+
+function computeMonthTotals(key) {
+  const m = state.finance[key] || {};
+  const mensalidade = getMensalidade(key);
   const convidadosReceita = parseN(m.convidadosQtd) * parseN(m.convidadosValor);
-  const receitas = parseN(m.mensalidade) + parseN(m.almocoRecebido) + convidadosReceita;
+  const receitas = mensalidade + parseN(m.almocoRecebido) + convidadosReceita;
   const custos = parseN(m.almocoDespesa) + parseN(m.quadra) + parseN(m.custosDiversos);
-  const saldoMes = receitas - custos;
-  return { convidadosReceita, receitas, custos, saldoMes };
+  return { mensalidade, convidadosReceita, receitas, custos, saldoMes: receitas - custos };
 }
 
 function ensureCurrentMonth() {
   const key = monthKey(currentYear, currentMonthIndex);
   if (!state.finance[key]) {
-    state.finance[key] = {
-      mensalidade: 0,
-      almocoRecebido: 0,
-      almocoDespesa: 0,
-      convidadosQtd: 0,
-      convidadosValor: 0,
-      quadra: 0,
-      custosDiversos: 0
-    };
+    // Pré-preenche com o mês anterior (Q13a).
+    const prevKey = currentMonthIndex > 0
+      ? monthKey(currentYear, currentMonthIndex - 1)
+      : monthKey(currentYear - 1, 11);
+    const prev = state.finance[prevKey] || {};
+    const seed = { mensalidadeManual: null };
+    FINANCE_FIELDS.forEach((f) => { seed[f] = f === "convidadosQtd" ? 0 : parseN(prev[f]); });
+    // convidados costumam variar; zera a quantidade mas mantém o valor unitário.
+    seed.convidadosQtd = 0;
+    state.finance[key] = seed;
   }
 }
 
-function renderOnboarding() {
-  const root = document.getElementById("onboarding");
-  if (state.setupDone) {
-    root.innerHTML = `<h2>Fluxo inicial concluído</h2><p>Saldo do ano anterior e meses passados já foram salvos.</p>`;
-    return;
-  }
+/* ============================================================
+   SETUP INICIAL (overlay)
+   ============================================================ */
+function financeFieldsHTML(prefix, data = {}) {
+  const f = (field, label, step = "0.01") =>
+    `<label>${label}<input type="number" min="0" step="${step}" data-field="${field}" value="${data[field] ?? 0}" /></label>`;
+  return `
+    ${f("mensalidadeManual", "Mensalidade recebida (total)")}
+    ${f("almocoRecebido", "Recebido p/ almoço")}
+    ${f("almocoDespesa", "Despesa do almoço")}
+    ${f("convidadosQtd", "Qtd. convidados", "1")}
+    ${f("convidadosValor", "Valor por convidado")}
+    ${f("quadra", "Quadra")}
+    ${f("custosDiversos", "Custos diversos")}
+  `;
+}
+
+function readFinanceFrom(container, { manual = false } = {}) {
+  const get = (field) => {
+    const input = container.querySelector(`[data-field="${field}"]`);
+    return input ? parseN(input.value) : 0;
+  };
+  const data = { mensalidadeManual: manual ? get("mensalidadeManual") : null };
+  FINANCE_FIELDS.forEach((f) => { data[f] = get(f); });
+  return data;
+}
+
+function renderSetup() {
+  const overlay = el("setup-overlay");
+  if (state.setupDone) { overlay.classList.add("hidden"); return; }
+  overlay.classList.remove("hidden");
 
   const pastMonths = Array.from({ length: currentMonthIndex }, (_, i) => i);
-  root.innerHTML = `
-    <h2>Configuração Inicial</h2>
-    <p>1) Informe o saldo acumulado do ano passado.<br/>2) Preencha receitas e custos de ${pastMonths.length ? "cada mês passado" : "nenhum mês passado"} até ${monthNames[currentMonthIndex - 1] || "o mês anterior"}.<br/>3) Salve para iniciar o mês atual (${monthNames[currentMonthIndex]}).</p>
-    <form id="onboarding-form" class="form-grid">
-      <label>Saldo acumulado do ano passado
-        <input type="number" min="0" step="0.01" id="previous-balance" required value="${state.previousYearBalance || 0}" />
+  const form = el("setup-form");
+  form.innerHTML = `
+    <div class="form-grid">
+      <label>Saldo do ano passado
+        <input type="number" step="0.01" id="setup-prev" value="${state.previousYearBalance || 0}" />
       </label>
-      ${pastMonths.map(i => `
-        <fieldset class="pill">
-          <legend>${monthNames[i]} (${currentYear})</legend>
-          <div class="form-grid" data-month="${i}"></div>
-        </fieldset>
-      `).join("")}
-      <button type="submit" class="primary">Salvar configuração inicial</button>
-    </form>
+      <label>Valor da mensalidade (por jogador)
+        <input type="number" min="0" step="0.01" id="setup-fee" value="${state.settings.monthlyFee || 0}" required />
+      </label>
+    </div>
+    ${pastMonths.length ? `<p class="hint">Lance os meses passados de ${currentYear} (mensalidade digitada à mão).</p>` : `<p class="hint">Nenhum mês passado neste ano — é só começar.</p>`}
+    ${pastMonths.map((i) => `
+      <fieldset class="setup-month" data-month="${i}">
+        <div class="legend">${monthNames[i]} / ${currentYear}</div>
+        <div class="form-grid">${financeFieldsHTML("m" + i, state.finance[monthKey(currentYear, i)] || {})}</div>
+      </fieldset>
+    `).join("")}
+    <button type="submit" class="primary block">Salvar e começar</button>
   `;
 
-  const template = document.getElementById("finance-fields-template").content;
-  root.querySelectorAll("[data-month]").forEach((container) => {
-    container.appendChild(template.cloneNode(true));
-    const idx = Number(container.dataset.month);
-    const data = state.finance[monthKey(currentYear, idx)] || {};
-    setupFinanceInputs(container, data);
-  });
-
-  root.querySelector("#onboarding-form").addEventListener("submit", (e) => {
+  form.onsubmit = (e) => {
     e.preventDefault();
-    state.previousYearBalance = parseN(document.getElementById("previous-balance").value);
-    root.querySelectorAll("[data-month]").forEach((container) => {
-      const idx = Number(container.dataset.month);
-      const key = monthKey(currentYear, idx);
-      state.finance[key] = readFinanceFrom(container);
+    state.previousYearBalance = parseN(el("setup-prev").value);
+    state.settings.monthlyFee = parseN(el("setup-fee").value);
+    form.querySelectorAll("[data-month]").forEach((fs) => {
+      const idx = Number(fs.dataset.month);
+      state.finance[monthKey(currentYear, idx)] = readFinanceFrom(fs, { manual: true });
     });
     state.setupDone = true;
     ensureCurrentMonth();
     saveState();
-    rerenderAll();
-  });
-}
-
-function setupFinanceInputs(container, data) {
-  const input = (field) => container.querySelector(`[data-field="${field}"]`);
-  ["mensalidade", "almocoRecebido", "almocoDespesa", "convidadosQtd", "convidadosValor", "quadra", "custosDiversos"].forEach((f) => {
-    if (input(f)) input(f).value = data[f] ?? 0;
-  });
-
-  const updateRevenue = () => {
-    const v = parseN(input("convidadosQtd")?.value) * parseN(input("convidadosValor")?.value);
-    if (input("convidadosReceita")) input("convidadosReceita").value = v.toFixed(2);
-  };
-  container.querySelectorAll("input").forEach((el) => el.addEventListener("input", updateRevenue));
-  updateRevenue();
-}
-
-function readFinanceFrom(container) {
-  return {
-    mensalidade: parseN(container.querySelector('[data-field="mensalidade"]').value),
-    almocoRecebido: parseN(container.querySelector('[data-field="almocoRecebido"]').value),
-    almocoDespesa: parseN(container.querySelector('[data-field="almocoDespesa"]').value),
-    convidadosQtd: parseN(container.querySelector('[data-field="convidadosQtd"]').value),
-    convidadosValor: parseN(container.querySelector('[data-field="convidadosValor"]').value),
-    quadra: parseN(container.querySelector('[data-field="quadra"]').value),
-    custosDiversos: parseN(container.querySelector('[data-field="custosDiversos"]').value)
+    overlay.classList.add("hidden");
+    renderAll();
+    toast("Tudo pronto! 🎉");
   };
 }
 
-function renderCurrentMonthFinance() {
+/* ============================================================
+   FINANCEIRO (mês atual)
+   ============================================================ */
+function renderFinance() {
   ensureCurrentMonth();
-  const form = document.getElementById("current-month-form");
-  form.innerHTML = "";
-  const template = document.getElementById("finance-fields-template").content.cloneNode(true);
-  form.appendChild(template);
   const key = monthKey(currentYear, currentMonthIndex);
-  setupFinanceInputs(form, state.finance[key]);
+  el("current-month-label").textContent = `${monthNames[currentMonthIndex]} ${currentYear}`;
 
-  const refreshSummary = () => {
-    state.finance[key] = readFinanceFrom(form);
-    const t = computeMonthTotals(state.finance[key]);
-    document.getElementById("current-month-summary").innerHTML = `
-      <strong>${monthNames[currentMonthIndex]} ${currentYear}</strong><br/>
-      Receitas: ${fmt(t.receitas)} | Custos: ${fmt(t.custos)} | Saldo do mês: <strong>${fmt(t.saldoMes)}</strong>
-    `;
+  const form = el("current-month-form");
+  form.innerHTML = `
+    <label>Recebido p/ almoço<input type="number" min="0" step="0.01" data-field="almocoRecebido" /></label>
+    <label>Despesa do almoço<input type="number" min="0" step="0.01" data-field="almocoDespesa" /></label>
+    <label>Qtd. convidados<input type="number" min="0" step="1" data-field="convidadosQtd" /></label>
+    <label>Valor por convidado<input type="number" min="0" step="0.01" data-field="convidadosValor" /></label>
+    <label>Quadra<input type="number" min="0" step="0.01" data-field="quadra" /></label>
+    <label>Custos diversos<input type="number" min="0" step="0.01" data-field="custosDiversos" /></label>
+  `;
+  const data = state.finance[key];
+  FINANCE_FIELDS.forEach((f) => {
+    const input = form.querySelector(`[data-field="${f}"]`);
+    if (input) input.value = data[f] ?? 0;
+  });
+
+  const refresh = () => {
+    const updated = readFinanceFrom(form);
+    updated.mensalidadeManual = null; // mês atual = automático
+    state.finance[key] = updated;
     saveState();
+    renderFinanceSummary(key);
     renderReports();
   };
-
-  form.querySelectorAll("input").forEach((el) => el.addEventListener("input", refreshSummary));
-  refreshSummary();
+  form.querySelectorAll("input").forEach((i) => i.addEventListener("input", refresh));
+  renderFinanceSummary(key);
+  renderPayments(key);
 }
 
-function renderMembers() {
-  const form = document.getElementById("member-form");
-  let editingId = null;
+function renderFinanceSummary(key) {
+  const t = computeMonthTotals(key);
+  const cls = t.saldoMes >= 0 ? "pos" : "neg";
+  el("current-month-summary").innerHTML = `
+    <div class="metric"><span>Receitas</span><strong class="pos">${fmt(t.receitas)}</strong></div>
+    <div class="metric"><span>Custos</span><strong class="neg">${fmt(t.custos)}</strong></div>
+    <div class="metric"><span>Saldo do mês</span><strong class="${cls}">${fmt(t.saldoMes)}</strong></div>
+  `;
+}
 
+function renderPayments(key) {
+  const list = el("payments-list");
+  const fee = parseN(state.settings.monthlyFee);
+  el("fee-hint").textContent = `Mensalidade: ${fmt(fee)} por jogador. Total recebido no mês é calculado por quem pagou.`;
+  if (!state.payments[key]) state.payments[key] = {};
+  const paid = state.payments[key];
+
+  if (!state.members.length) {
+    list.innerHTML = `<li class="hint">Cadastre membros na aba Membros.</li>`;
+    el("payments-count").textContent = "0 pagos";
+    return;
+  }
+
+  list.innerHTML = state.members.map((m) => `
+    <li>
+      <label class="toggle">
+        <input type="checkbox" data-pay="${m.id}" ${paid[m.id] ? "checked" : ""} />
+        <span>${m.name}</span>
+      </label>
+      <span class="badge ${paid[m.id] ? "ok" : "no"}">${paid[m.id] ? "Pago" : "Pendente"}</span>
+    </li>
+  `).join("");
+
+  list.querySelectorAll("[data-pay]").forEach((cb) => {
+    cb.onchange = () => {
+      if (cb.checked) state.payments[key][cb.dataset.pay] = true;
+      else delete state.payments[key][cb.dataset.pay];
+      saveState();
+      renderPayments(key);
+      renderFinanceSummary(key);
+      renderReports();
+    };
+  });
+  el("payments-count").textContent = `${paidCount(key)}/${state.members.length} pagos`;
+}
+
+/* ============================================================
+   MEMBROS
+   ============================================================ */
+let editingMemberId = null;
+
+function renderMemberForm() {
+  const form = el("member-form");
   form.onsubmit = (e) => {
     e.preventDefault();
+    const name = el("member-name").value.trim();
+    if (!name) return;
     const member = {
-      id: editingId || crypto.randomUUID(),
-      name: document.getElementById("member-name").value.trim(),
-      position: document.getElementById("member-position").value,
-      goals: parseN(document.getElementById("member-goals").value),
-      assists: parseN(document.getElementById("member-assists").value),
-      paidCurrentMonth: document.getElementById("member-paid").checked
+      id: editingMemberId || uid(),
+      name,
+      position: el("member-position").value,
+      shirt: el("member-shirt").value ? parseN(el("member-shirt").value) : null
     };
-    if (!member.name) return;
-
     const idx = state.members.findIndex((m) => m.id === member.id);
     if (idx >= 0) state.members[idx] = member;
     else state.members.push(member);
-
-    editingId = null;
-    form.reset();
+    resetMemberForm();
     saveState();
-    fillMembersTable();
+    renderMembers();
     renderMatchPlayers();
+    renderPayments(monthKey(currentYear, currentMonthIndex));
+    renderFinanceSummary(monthKey(currentYear, currentMonthIndex));
     renderReports();
+    toast(idx >= 0 ? "Membro atualizado" : "Membro adicionado");
   };
-
-  function fillMembersTable() {
-    const tbody = document.querySelector("#members-table tbody");
-    tbody.innerHTML = state.members.map((m) => `
-      <tr>
-        <td>${m.name}</td>
-        <td>${m.position}</td>
-        <td>${m.goals}</td>
-        <td>${m.assists}</td>
-        <td><span class="badge ${m.paidCurrentMonth ? "ok" : "no"}">${m.paidCurrentMonth ? "Sim" : "Não"}</span></td>
-        <td>
-          <button data-edit="${m.id}">Editar</button>
-          <button class="danger" data-del="${m.id}">Remover</button>
-        </td>
-      </tr>
-    `).join("");
-
-    tbody.querySelectorAll("[data-edit]").forEach((btn) => btn.onclick = () => {
-      const m = state.members.find((x) => x.id === btn.dataset.edit);
-      editingId = m.id;
-      document.getElementById("member-name").value = m.name;
-      document.getElementById("member-position").value = m.position;
-      document.getElementById("member-goals").value = m.goals;
-      document.getElementById("member-assists").value = m.assists;
-      document.getElementById("member-paid").checked = !!m.paidCurrentMonth;
-    });
-
-    tbody.querySelectorAll("[data-del]").forEach((btn) => btn.onclick = () => {
-      state.members = state.members.filter((x) => x.id !== btn.dataset.del);
-      saveState();
-      fillMembersTable();
-      renderMatchPlayers();
-      renderReports();
-    });
-  }
-
-  fillMembersTable();
+  el("member-cancel").onclick = resetMemberForm;
 }
 
-function renderMatchesForm() {
-  const form = document.getElementById("match-form");
-  form.innerHTML = `
-    <label>Data da partida <input type="date" id="match-date" required value="${now.toISOString().slice(0,10)}" /></label>
-    <label>Time A <input id="team-a" value="Azul" /></label>
-    <label>Time B <input id="team-b" value="Vermelho" /></label>
-    <label>Placar Time A <input type="number" min="0" id="score-a" value="0" /></label>
-    <label>Placar Time B <input type="number" min="0" id="score-b" value="0" /></label>
-  `;
+function resetMemberForm() {
+  editingMemberId = null;
+  el("member-form").reset();
+  el("member-submit").textContent = "Adicionar membro";
+  el("member-cancel").classList.add("hidden");
+}
 
-  document.getElementById("save-match").onclick = () => {
-    const selected = [...document.querySelectorAll(".player-card")]
-      .filter((card) => card.querySelector("[data-use]").checked)
-      .map((card) => ({
+function startEditMember(id) {
+  const m = memberById(id);
+  if (!m) return;
+  editingMemberId = id;
+  el("member-name").value = m.name;
+  el("member-position").value = m.position;
+  el("member-shirt").value = m.shirt ?? "";
+  el("member-submit").textContent = "Salvar alterações";
+  el("member-cancel").classList.remove("hidden");
+  el("member-name").focus();
+}
+
+function renderMembers() {
+  const list = el("members-list");
+  el("members-count").textContent = `${state.members.length} jogador(es)`;
+  if (!state.members.length) {
+    list.innerHTML = `<p class="hint">Nenhum membro ainda.</p>`;
+    return;
+  }
+  list.innerHTML = state.members.map((m) => {
+    const s = scoutsOf(m.id);
+    return `
+      <div class="member-row" data-profile="${m.id}">
+        <div class="member-avatar">${initials(m.name)}</div>
+        <div class="member-info">
+          <div class="name">${m.name} ${m.shirt ? `<small class="pc-pos">#${m.shirt}</small>` : ""}</div>
+          <div class="meta">${m.position} · ${s.games} jogo(s)</div>
+        </div>
+        <div class="member-stats">${s.goals}G / ${s.assists}A</div>
+        <div class="member-actions">
+          <button class="tiny ghost" data-edit="${m.id}">✏️</button>
+          <button class="tiny danger" data-del="${m.id}">🗑️</button>
+        </div>
+      </div>`;
+  }).join("");
+
+  list.querySelectorAll("[data-profile]").forEach((row) => {
+    row.onclick = (e) => {
+      if (e.target.closest("[data-edit]") || e.target.closest("[data-del]")) return;
+      openProfile(row.dataset.profile);
+    };
+  });
+  list.querySelectorAll("[data-edit]").forEach((b) => b.onclick = () => startEditMember(b.dataset.edit));
+  list.querySelectorAll("[data-del]").forEach((b) => b.onclick = () => {
+    const m = memberById(b.dataset.del);
+    if (!confirm(`Remover ${m?.name}? Isso não apaga as partidas já registradas.`)) return;
+    state.members = state.members.filter((x) => x.id !== b.dataset.del);
+    Object.values(state.payments).forEach((p) => delete p[b.dataset.del]);
+    saveState();
+    renderMembers();
+    renderMatchPlayers();
+    renderPayments(monthKey(currentYear, currentMonthIndex));
+    renderReports();
+  });
+}
+
+/* ============================================================
+   PERFIL DO JOGADOR (modal)
+   ============================================================ */
+function openProfile(id) {
+  const m = memberById(id);
+  if (!m) return;
+  const s = scoutsOf(id);
+  const payMonths = Object.keys(state.payments)
+    .filter((k) => state.payments[k][id])
+    .sort();
+  const body = el("profile-body");
+  body.innerHTML = `
+    <div class="profile-head">
+      <div class="member-avatar">${initials(m.name)}</div>
+      <div>
+        <h2>${m.name}</h2>
+        <div class="hint">${m.position}${m.shirt ? ` · Camisa #${m.shirt}` : ""}</div>
+      </div>
+    </div>
+    <div class="profile-stats">
+      <div class="metric"><span>Jogos</span><strong>${s.games}</strong></div>
+      <div class="metric"><span>Gols</span><strong>${s.goals}</strong></div>
+      <div class="metric"><span>Assist.</span><strong>${s.assists}</strong></div>
+      <div class="metric"><span>Scouts</span><strong>${s.total}</strong></div>
+    </div>
+    <div class="profile-stats">
+      <div class="metric"><span>Vitórias</span><strong class="pos">${s.wins}</strong></div>
+      <div class="metric"><span>Empates</span><strong>${s.draws}</strong></div>
+      <div class="metric"><span>Derrotas</span><strong class="neg">${s.losses}</strong></div>
+      <div class="metric"><span>Aproveit.</span><strong>${s.games ? Math.round((s.wins / s.games) * 100) : 0}%</strong></div>
+    </div>
+    <h3>Mensalidades pagas</h3>
+    ${payMonths.length
+      ? `<p>${payMonths.map((k) => { const [y, mo] = k.split("-"); return `<span class="chip">${monthNames[Number(mo) - 1]}/${y}</span>`; }).join(" ")}</p>`
+      : `<p class="hint">Nenhum pagamento registrado.</p>`}
+  `;
+  el("profile-modal").classList.remove("hidden");
+}
+
+/* ============================================================
+   PARTIDAS
+   ============================================================ */
+let editingMatchId = null;
+
+function renderMatchForm() {
+  const form = el("match-form");
+  const editing = editingMatchId ? state.matches.find((x) => x.id === editingMatchId) : null;
+  form.innerHTML = `
+    <label class="full">Data da partida<input type="date" id="match-date" required value="${editing ? editing.date : now.toISOString().slice(0, 10)}" /></label>
+    <label>Time A (nome)<input id="team-a" value="${editing ? editing.teamAName : "Preto"}" /></label>
+    <label>Time B (nome)<input id="team-b" value="${editing ? editing.teamBName : "Vermelho"}" /></label>
+    <label>Placar A<input type="number" min="0" id="score-a" value="${editing ? editing.scoreA : 0}" /></label>
+    <label>Placar B<input type="number" min="0" id="score-b" value="${editing ? editing.scoreB : 0}" /></label>
+  `;
+  el("match-form-title").textContent = editing ? "Editar partida" : "Nova partida";
+  el("match-cancel").classList.toggle("hidden", !editing);
+  el("save-match").textContent = editing ? "Salvar alterações" : "Salvar partida";
+  renderMatchPlayers(editing);
+}
+
+function renderMatchPlayers(editing = null) {
+  const container = el("match-players");
+  if (!state.members.length) {
+    container.innerHTML = `<p class="hint">Cadastre membros para montar a partida.</p>`;
+    return;
+  }
+  const byId = {};
+  if (editing) editing.players.forEach((p) => { byId[p.memberId] = p; });
+
+  container.innerHTML = state.members.map((m) => {
+    const p = byId[m.id];
+    const included = !!p;
+    const teamBadge = p && p.team
+      ? `<span class="badge team-${p.team.toLowerCase()}">${p.team}</span>`
+      : "";
+    return `
+      <div class="player-card ${included ? "included" : ""}" data-member="${m.id}">
+        <div class="pc-head">
+          <label class="checkbox"><input type="checkbox" data-use ${included ? "checked" : ""} />
+            <span class="pc-name">${m.name}</span> <span class="pc-pos">${m.position}</span>
+          </label>
+          <span data-team-badge>${teamBadge}</span>
+        </div>
+        <div class="pc-inputs">
+          <label>Camisa<input type="number" min="1" data-shirt value="${p ? p.shirt : (m.shirt ?? "")}" /></label>
+          <label>Gols<input type="number" min="0" data-goals value="${p ? p.goals : 0}" /></label>
+          <label>Assist.<input type="number" min="0" data-assists value="${p ? p.assists : 0}" /></label>
+        </div>
+      </div>`;
+  }).join("");
+
+  container.querySelectorAll(".player-card").forEach((card) => {
+    const cb = card.querySelector("[data-use]");
+    cb.onchange = () => card.classList.toggle("included", cb.checked);
+  });
+}
+
+function collectMatchPlayers() {
+  return [...document.querySelectorAll(".player-card")]
+    .filter((card) => card.querySelector("[data-use]").checked)
+    .map((card) => {
+      const badge = card.querySelector("[data-team-badge] .badge");
+      const team = badge ? badge.textContent.trim() : null;
+      return {
         memberId: card.dataset.member,
+        team: team === "A" || team === "B" ? team : null,
         shirt: parseN(card.querySelector("[data-shirt]").value),
         goals: parseN(card.querySelector("[data-goals]").value),
         assists: parseN(card.querySelector("[data-assists]").value)
-      }));
-
-    const match = {
-      id: crypto.randomUUID(),
-      date: document.getElementById("match-date").value,
-      teamA: document.getElementById("team-a").value,
-      teamB: document.getElementById("team-b").value,
-      scoreA: parseN(document.getElementById("score-a").value),
-      scoreB: parseN(document.getElementById("score-b").value),
-      players: selected
-    };
-
-    selected.forEach((entry) => {
-      const m = state.members.find((x) => x.id === entry.memberId);
-      if (m) {
-        m.goals += entry.goals;
-        m.assists += entry.assists;
-      }
+      };
     });
+}
 
-    state.matches.unshift(match);
+// Sorteio: 2 times equilibrados por posição + nível (scouts), só dos presentes (Q11).
+function drawTeams() {
+  const cards = [...document.querySelectorAll(".player-card")].filter((c) => c.querySelector("[data-use]").checked);
+  if (cards.length < 2) { toast("Marque ao menos 2 jogadores"); return; }
+
+  const present = cards.map((card) => {
+    const m = memberById(card.dataset.member);
+    return { card, skill: scoutsOf(m.id).total, position: m.position };
+  });
+
+  const order = { Goleiro: 0, Zagueiro: 1, Meio: 2, Ataque: 3 };
+  present.sort((a, b) => (order[a.position] - order[b.position]) || (b.skill - a.skill));
+
+  const teams = { A: { players: [], skill: 0 }, B: { players: [], skill: 0 } };
+  present.forEach((p) => {
+    // vai para o time com menos jogadores; empate -> menor soma de nível.
+    const target = teams.A.players.length !== teams.B.players.length
+      ? (teams.A.players.length < teams.B.players.length ? "A" : "B")
+      : (teams.A.skill <= teams.B.skill ? "A" : "B");
+    teams[target].players.push(p);
+    teams[target].skill += p.skill;
+    const badge = p.card.querySelector("[data-team-badge]");
+    badge.innerHTML = `<span class="badge team-${target.toLowerCase()}">${target}</span>`;
+  });
+  toast(`Times sorteados: A(${teams.A.players.length}) x B(${teams.B.players.length})`);
+}
+
+function saveMatch() {
+  const players = collectMatchPlayers();
+  if (!players.length) { toast("Selecione quem jogou"); return; }
+  const data = {
+    date: el("match-date").value,
+    teamAName: el("team-a").value.trim() || "Time A",
+    teamBName: el("team-b").value.trim() || "Time B",
+    scoreA: parseN(el("score-a").value),
+    scoreB: parseN(el("score-b").value),
+    players
+  };
+  if (editingMatchId) {
+    const idx = state.matches.findIndex((x) => x.id === editingMatchId);
+    if (idx >= 0) state.matches[idx] = Object.assign({ id: editingMatchId }, data);
+    editingMatchId = null;
+  } else {
+    state.matches.unshift(Object.assign({ id: uid() }, data));
+  }
+  saveState();
+  renderMatchForm();
+  renderMatchesList();
+  renderMembers();
+  renderReports();
+  toast("Partida salva ✅");
+}
+
+function renderMatchesList() {
+  const list = el("matches-list");
+  el("matches-count").textContent = `${state.matches.length} partida(s)`;
+  if (!state.matches.length) {
+    list.innerHTML = `<p class="hint">Nenhuma partida registrada.</p>`;
+    return;
+  }
+  list.innerHTML = state.matches.map((m) => {
+    const players = m.players.map((p) => {
+      const mem = memberById(p.memberId);
+      const nm = mem ? mem.name : "Jogador";
+      const sc = (p.goals || p.assists) ? ` (${p.goals}G/${p.assists}A)` : "";
+      return nm + sc;
+    }).join(", ");
+    return `
+      <div class="match-item">
+        <div class="mi-top">
+          <span class="score">${m.teamAName} ${m.scoreA} × ${m.scoreB} ${m.teamBName}</span>
+          <span class="mi-date">${formatDate(m.date)}</span>
+        </div>
+        <div class="mi-players">${players}</div>
+        <div class="mi-actions">
+          <button class="tiny ghost" data-edit-match="${m.id}">Editar</button>
+          <button class="tiny danger" data-del-match="${m.id}">Excluir</button>
+        </div>
+      </div>`;
+  }).join("");
+
+  list.querySelectorAll("[data-edit-match]").forEach((b) => b.onclick = () => {
+    editingMatchId = b.dataset.editMatch;
+    renderMatchForm();
+    document.querySelector('[data-tab="matches"]').click();
+    el("match-form").scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+  list.querySelectorAll("[data-del-match]").forEach((b) => b.onclick = () => {
+    if (!confirm("Excluir esta partida? Os scouts serão recalculados.")) return;
+    state.matches = state.matches.filter((x) => x.id !== b.dataset.delMatch);
+    if (editingMatchId === b.dataset.delMatch) { editingMatchId = null; renderMatchForm(); }
     saveState();
-    renderMatchPlayers();
-    renderMatchesTable();
+    renderMatchesList();
     renderMembers();
     renderReports();
-  };
-
-  renderMatchPlayers();
-  renderMatchesTable();
+    toast("Partida excluída");
+  });
 }
 
-function renderMatchPlayers() {
-  const container = document.getElementById("match-players");
-  container.innerHTML = state.members.map((m, idx) => `
-    <div class="player-card" data-member="${m.id}">
-      <strong>${m.name}</strong> <small>(${m.position})</small>
-      <label class="checkbox"><input data-use type="checkbox" /> Incluir na partida</label>
-      <label>Camisa na partida <input data-shirt type="number" min="1" value="${idx + 1}" /></label>
-      <label>Gols no jogo <input data-goals type="number" min="0" value="0" /></label>
-      <label>Assistências no jogo <input data-assists type="number" min="0" value="0" /></label>
-    </div>
-  `).join("");
+function formatDate(iso) {
+  if (!iso) return "";
+  const [y, m, d] = iso.split("-");
+  return `${d}/${m}/${y}`;
 }
 
-function renderMatchesTable() {
-  const tbody = document.querySelector("#matches-table tbody");
-  tbody.innerHTML = state.matches.map((m) => `
-    <tr>
-      <td>${m.date}</td>
-      <td>${m.teamA} ${m.scoreA} x ${m.scoreB} ${m.teamB}</td>
-      <td>${m.players.map((p) => {
-        const member = state.members.find((x) => x.id === p.memberId);
-        return `${member?.name || "Jogador"} (#${p.shirt}, G:${p.goals}, A:${p.assists})`;
-      }).join("; ")}</td>
-    </tr>
-  `).join("");
-}
+/* ============================================================
+   RELATÓRIOS + GRÁFICOS
+   ============================================================ */
+let charts = { balance: null, scouts: null };
 
 function renderReports() {
-  const financeRoot = document.getElementById("finance-report");
-  const scoutRoot = document.getElementById("scout-report");
-
   const keys = Object.keys(state.finance).sort();
-  let accum = state.previousYearBalance || 0;
+  let accum = parseN(state.previousYearBalance);
+  const rows = [];
+  const labels = [], balances = [];
+  keys.forEach((k) => {
+    const [y, m] = k.split("-");
+    const t = computeMonthTotals(k);
+    accum += t.saldoMes;
+    rows.push({ label: `${monthNames[Number(m) - 1]}/${y}`, t, accum });
+    labels.push(`${monthNames[Number(m) - 1].slice(0, 3)}/${y.slice(2)}`);
+    balances.push(Number(accum.toFixed(2)));
+  });
 
-  financeRoot.innerHTML = `
-    <p><strong>Saldo inicial (ano passado):</strong> ${fmt(state.previousYearBalance)}</p>
+  el("finance-report").innerHTML = `
+    <p class="hint">Saldo inicial (ano passado): <strong>${fmt(state.previousYearBalance)}</strong></p>
     <div class="table-wrap"><table>
-      <thead><tr><th>Mês</th><th>Receitas</th><th>Custos</th><th>Saldo mês</th><th>Saldo acumulado</th></tr></thead>
+      <thead><tr><th>Mês</th><th>Receitas</th><th>Custos</th><th>Saldo</th><th>Acumulado</th></tr></thead>
       <tbody>
-      ${keys.map((k) => {
-        const [y, m] = k.split("-");
-        const t = computeMonthTotals(state.finance[k]);
-        accum += t.saldoMes;
-        return `<tr><td>${monthNames[Number(m) - 1]}/${y}</td><td>${fmt(t.receitas)}</td><td>${fmt(t.custos)}</td><td>${fmt(t.saldoMes)}</td><td>${fmt(accum)}</td></tr>`;
-      }).join("")}
+        ${rows.map((r) => `<tr>
+          <td>${r.label}</td>
+          <td class="pos">${fmt(r.t.receitas)}</td>
+          <td class="neg">${fmt(r.t.custos)}</td>
+          <td class="${r.t.saldoMes >= 0 ? "pos" : "neg"}">${fmt(r.t.saldoMes)}</td>
+          <td class="${r.accum >= 0 ? "pos" : "neg"}"><strong>${fmt(r.accum)}</strong></td>
+        </tr>`).join("")}
       </tbody>
     </table></div>
   `;
 
-  const ranking = [...state.members].sort((a, b) => (b.goals + b.assists) - (a.goals + a.assists));
-  const topGoals = [...state.members].sort((a,b)=>b.goals-a.goals)[0];
-  const topAssists = [...state.members].sort((a,b)=>b.assists-a.assists)[0];
-  const bestDef = [...state.members].filter(m=>m.position === "Zagueiro").sort((a,b)=>(b.goals+b.assists)-(a.goals+a.assists))[0];
-  const bestGk = [...state.members].filter(m=>m.position === "Goleiro").sort((a,b)=>(b.goals+b.assists)-(a.goals+a.assists))[0];
-  const mvp = ranking[0];
+  // Ranking de scouts
+  const ranked = state.members
+    .map((m) => ({ m, s: scoutsOf(m.id) }))
+    .sort((a, b) => b.s.total - a.s.total);
 
-  scoutRoot.innerHTML = `
+  const topGoals = [...ranked].sort((a, b) => b.s.goals - a.s.goals)[0];
+  const topAssists = [...ranked].sort((a, b) => b.s.assists - a.s.assists)[0];
+  const bestDef = ranked.filter((r) => r.m.position === "Zagueiro")[0];
+  const bestGk = ranked.filter((r) => r.m.position === "Goleiro")[0];
+  const mvp = ranked[0];
+  const award = (r, min = 0) => (r && r.s.total > min ? r.m.name : "—");
+
+  el("scout-report").innerHTML = `
     <div class="table-wrap"><table>
-      <thead><tr><th>Jogador</th><th>Posição</th><th>Gols</th><th>Assistências</th><th>Scouts totais</th></tr></thead>
+      <thead><tr><th>#</th><th>Jogador</th><th>Pos.</th><th>Gols</th><th>Assist.</th><th>Total</th></tr></thead>
       <tbody>
-        ${ranking.map((m) => `<tr><td>${m.name}</td><td>${m.position}</td><td>${m.goals}</td><td>${m.assists}</td><td>${m.goals + m.assists}</td></tr>`).join("")}
+        ${ranked.map((r, i) => `<tr>
+          <td>${i + 1}</td><td>${r.m.name}</td><td>${r.m.position}</td>
+          <td>${r.s.goals}</td><td>${r.s.assists}</td><td><strong>${r.s.total}</strong></td>
+        </tr>`).join("") || `<tr><td colspan="6" class="hint">Sem dados ainda.</td></tr>`}
       </tbody>
     </table></div>
-    <div class="pill">
-      <h4>Premiações do ano (parcial)</h4>
-      <p>🏆 Artilheiro: <strong>${topGoals?.name || "-"}</strong></p>
-      <p>🎯 Líder em assistências: <strong>${topAssists?.name || "-"}</strong></p>
-      <p>🛡️ Melhor zagueiro: <strong>${bestDef?.name || "-"}</strong></p>
-      <p>🧤 Melhor goleiro: <strong>${bestGk?.name || "-"}</strong></p>
-      <p>⭐ Craque do ano (G+A): <strong>${mvp?.name || "-"}</strong></p>
+    <div class="awards">
+      <div class="award"><span>🏆 Artilheiro</span><strong>${topGoals && topGoals.s.goals ? topGoals.m.name : "—"}</strong></div>
+      <div class="award"><span>🎯 Assistências</span><strong>${topAssists && topAssists.s.assists ? topAssists.m.name : "—"}</strong></div>
+      <div class="award"><span>🛡️ Melhor zagueiro</span><strong>${award(bestDef)}</strong></div>
+      <div class="award"><span>🧤 Melhor goleiro</span><strong>${bestGk ? bestGk.m.name : "—"}</strong></div>
+      <div class="award"><span>⭐ Craque do ano</span><strong>${award(mvp)}</strong></div>
     </div>
   `;
+
+  drawCharts(labels, balances, ranked.slice(0, 6));
 }
 
-function rerenderAll() {
-  renderOnboarding();
-  renderCurrentMonthFinance();
-  renderMembers();
-  renderMatchesForm();
-  renderReports();
+function drawCharts(labels, balances, topRanked) {
+  if (typeof Chart === "undefined") return;
+  const accent = "#dc2626";
+  const black = "#18181b";
+
+  if (charts.balance) charts.balance.destroy();
+  charts.balance = new Chart(el("chart-balance"), {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{
+        label: "Saldo acumulado",
+        data: balances,
+        borderColor: accent,
+        backgroundColor: "rgba(220,38,38,0.1)",
+        fill: true,
+        tension: 0.3,
+        pointBackgroundColor: accent
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { y: { ticks: { callback: (v) => "R$ " + v } } }
+    }
+  });
+
+  if (charts.scouts) charts.scouts.destroy();
+  charts.scouts = new Chart(el("chart-scouts"), {
+    type: "bar",
+    data: {
+      labels: topRanked.map((r) => r.m.name),
+      datasets: [
+        { label: "Gols", data: topRanked.map((r) => r.s.goals), backgroundColor: black },
+        { label: "Assist.", data: topRanked.map((r) => r.s.assists), backgroundColor: accent }
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: { x: { stacked: true }, y: { stacked: true, ticks: { precision: 0 } } }
+    }
+  });
 }
 
-rerenderAll();
+/* ============================================================
+   CONFIGURAÇÕES + BACKUP
+   ============================================================ */
+function openSettings() {
+  el("setting-fee").value = state.settings.monthlyFee || 0;
+  el("setting-prev-balance").value = state.previousYearBalance || 0;
+  el("settings-modal").classList.remove("hidden");
+}
+
+function bindSettings() {
+  el("open-settings").onclick = openSettings;
+  el("settings-close").onclick = () => el("settings-modal").classList.add("hidden");
+  el("profile-close").onclick = () => el("profile-modal").classList.add("hidden");
+
+  el("settings-form").onsubmit = (e) => {
+    e.preventDefault();
+    state.settings.monthlyFee = parseN(el("setting-fee").value);
+    state.previousYearBalance = parseN(el("setting-prev-balance").value);
+    saveState();
+    el("settings-modal").classList.add("hidden");
+    renderAll();
+    toast("Configurações salvas");
+  };
+
+  el("export-data").onclick = () => {
+    const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `liga-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast("Backup exportado ⬇️");
+  };
+
+  el("import-data").onclick = () => el("import-file").click();
+  el("import-file").onchange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        if (!data || typeof data !== "object" || !("members" in data)) throw new Error("formato");
+        if (!confirm("Importar vai substituir todos os dados atuais. Continuar?")) return;
+        state = Object.assign(defaultState(), data);
+        state.version = 2;
+        saveState();
+        el("settings-modal").classList.add("hidden");
+        renderAll();
+        toast("Dados importados ⬆️");
+      } catch (_) {
+        toast("Arquivo inválido");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  el("reset-data").onclick = () => {
+    if (!confirm("Isso apaga TODOS os dados. Tem certeza?")) return;
+    if (!confirm("Última chance: apagar tudo mesmo?")) return;
+    state = defaultState();
+    saveState();
+    el("settings-modal").classList.add("hidden");
+    renderAll();
+    toast("Dados resetados");
+  };
+
+  // Fechar modais ao tocar no fundo.
+  [el("settings-modal"), el("profile-modal")].forEach((modal) => {
+    modal.onclick = (e) => { if (e.target === modal) modal.classList.add("hidden"); };
+  });
+}
+
+/* ============================================================
+   NAVEGAÇÃO POR ABAS
+   ============================================================ */
+function bindTabs() {
+  const buttons = document.querySelectorAll(".nav-btn");
+  const panels = document.querySelectorAll(".tab-panel");
+  buttons.forEach((btn) => btn.onclick = () => {
+    buttons.forEach((b) => b.classList.toggle("active", b === btn));
+    panels.forEach((p) => p.classList.toggle("active", p.dataset.panel === btn.dataset.tab));
+    window.scrollTo({ top: 0 });
+  });
+  // aba inicial
+  document.querySelector('[data-tab="finance"]').classList.add("active");
+  document.querySelector('[data-panel="finance"]').classList.add("active");
+}
+
+/* ============================================================
+   BOOT
+   ============================================================ */
+function renderAll() {
+  renderSetup();
+  if (state.setupDone) {
+    renderFinance();
+    renderMembers();
+    renderMatchForm();
+    renderMatchesList();
+    renderReports();
+  }
+}
+
+function init() {
+  bindTabs();
+  bindSettings();
+  renderMemberForm();
+  el("save-match").onclick = saveMatch;
+  el("draw-teams").onclick = drawTeams;
+  el("match-cancel").onclick = () => { editingMatchId = null; renderMatchForm(); };
+  renderAll();
+}
+
+init();
